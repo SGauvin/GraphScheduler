@@ -1,0 +1,18 @@
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Build and bin directories
+/build/
+/bin/
+
+# Documentation
+/doc/*
+!/doc/Doxyfile
+
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
