@@ -11,7 +11,7 @@ void busyWait(std::int64_t us)
     while (true)
     {
         auto now = std::chrono::high_resolution_clock::now();
-        if  (std::chrono::duration_cast<std::chrono::microseconds>(now - start).count() >= us)
+        if (std::chrono::duration_cast<std::chrono::microseconds>(now - start).count() >= us)
         {
             break;
         }

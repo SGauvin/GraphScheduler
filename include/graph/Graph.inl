@@ -5,6 +5,21 @@ requires(std::equality_comparable<P>) Graph<T, P, R, E>::Graph()
 }
 
 template<typename T, Hashable P, bool R, bool E>
+requires(std::equality_comparable<P>) Graph<T, P, R, E>::~Graph()
+{
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_stop = true;
+    }
+    m_condition.notify_all();
+
+    for (auto& worker : m_workers)
+    {
+        worker.join();
+    }
+}
+
+template<typename T, Hashable P, bool R, bool E>
 requires(std::equality_comparable<P>) template<typename Node>
 Node* Graph<T, P, R, E>::createNode(std::string_view nodeName, NodeInput<Node, P>&& inputs, NodeOutput<Node, P>&& outputs)
 {
@@ -130,14 +145,66 @@ void Graph<T, P, R, E>::setPlaceHolderValue(const P& placeHolder, const PlaceHol
 }
 
 template<typename T, Hashable P, bool R, bool E>
-requires(std::equality_comparable<P>) void Graph<T, P, R, E>::connectNodes(NodeConvertible auto& upstream,
-                                                                                         NodeConvertible auto& downstream)
+requires(std::equality_comparable<P>) void Graph<T, P, R, E>::connectNodes(NodeConvertible auto& upstream, NodeConvertible auto& downstream)
 {
     CpuNode* upstreamNodePtr = getNode(upstream);
     CpuNode* downstreamNodePtr = getNode(downstream);
 
     assert(upstreamNodePtr != nullptr && downstreamNodePtr != nullptr);
     connectNodes(upstreamNodePtr, downstreamNodePtr);
+}
+
+static void nodeExecutor(const bool& stop, std::latch& latch, std::mutex& mutex, std::condition_variable& condition,
+                         std::vector<CpuNode*>& unblockedNodes,
+                         std::unordered_map<CpuNode*, std::atomic<std::size_t>>& upstreamDependencyCount,
+                         const std::unordered_map<CpuNode*, std::vector<CpuNode*>>& downstreamDependencies)
+{
+    CpuNode* nodeToRun;
+    std::vector<CpuNode*> currentUnblockedNodes;
+    currentUnblockedNodes.reserve(unblockedNodes.capacity());
+    while (true)
+    {
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            condition.wait(lock, [&unblockedNodes, &stop] { return !unblockedNodes.empty() || stop; });
+            if (stop)
+            {
+                return;
+            }
+
+            nodeToRun = unblockedNodes.back();
+            unblockedNodes.pop_back();
+        }
+
+        nodeToRun->execute();
+
+        auto it = downstreamDependencies.find(nodeToRun);
+        if (it != downstreamDependencies.cend())
+        {
+            const std::vector<CpuNode*>& downstreamNodes = it->second;
+            for (CpuNode* node : downstreamNodes)
+            {
+                if (--upstreamDependencyCount.at(node) == 0)
+                {
+                    currentUnblockedNodes.push_back(node);
+                }
+            }
+
+            if (!currentUnblockedNodes.empty())
+            {
+                // We could avoid blocking here if the container was lockfree
+                std::unique_lock<std::mutex> lock(mutex);
+                for (CpuNode* node : currentUnblockedNodes)
+                {
+                    unblockedNodes.push_back(node);
+                }
+                condition.notify_all();
+            }
+            currentUnblockedNodes.clear();
+        }
+
+        latch.count_down();
+    }
 }
 
 template<typename T, Hashable P, bool R, bool E>
@@ -164,12 +231,26 @@ requires(std::equality_comparable<P>) void Graph<T, P, R, E>::build(const std::s
 
     for (const auto& node : m_nodes)
     {
-        if (!m_nodeUpstreamDependenciesCount.contains(node.get()))
+        if (!m_nodeUpstreamDependencyCount.contains(node.get()))
         {
             m_nodesWithoutUpstreamDependencies.push_back(node.get());
         }
     }
-    m_threadPool.start(numThreads);
+
+    m_unblockedNodes.reserve(m_nodes.size());
+
+    m_workers.reserve(numThreads);
+    for (std::size_t thread = 0; thread < numThreads; thread++)
+    {
+        m_workers.push_back(std::thread(nodeExecutor,
+                                        std::ref(m_stop),
+                                        std::ref(m_latch),
+                                        std::ref(m_mutex),
+                                        std::ref(m_condition),
+                                        std::ref(m_unblockedNodes),
+                                        std::ref(m_nodeUpstreamDependencyCountCopy),
+                                        std::ref(m_nodeDownstreamDependencies)));
+    }
 }
 
 template<typename T, Hashable P, bool R, bool E>
@@ -198,98 +279,20 @@ Node* Graph<T, P, R, E>::getNode(std::string_view nodeName)
 template<typename T, Hashable P, bool R, bool E>
 requires(std::equality_comparable<P>) void Graph<T, P, R, E>::execute()
 {
-    // std::vector<std::size_t> durations;
-    // durations.reserve(m_nodes.size());
-
-    // std::vector<std::size_t> enqueueTimes;
-    // enqueueTimes.reserve(m_nodes.size());
-
-    auto executeStart = std::chrono::high_resolution_clock::now();
-
-    for (const auto& [key, val] : m_nodeUpstreamDependenciesCount)
+    std::construct_at(reinterpret_cast<std::latch*>(&m_latchBuffer), m_nodes.size());
+    for (CpuNode* node : m_nodesWithoutUpstreamDependencies)
     {
-        m_nodeUpstreamDependenciesCountCopy[key].store(val.load());
+        m_unblockedNodes.push_back(node);
     }
 
-    auto enqueue = [this, /*&durations,*/ &executeStart](CpuNode* node)
+    for (const auto& [key, value] : m_nodeUpstreamDependencyCount)
     {
-        auto start = std::chrono::high_resolution_clock::now();
-        node->execute();
-        auto end = std::chrono::high_resolution_clock::now();
-
-        printf("(%p) Node start: %lu, Node end: %lu\n",
-               static_cast<void*>(node),
-               std::chrono::duration_cast<std::chrono::microseconds>(start - executeStart).count(),
-               std::chrono::duration_cast<std::chrono::microseconds>(end - executeStart).count());
-        // durations.push_back(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
-
-        auto it = m_nodeDownstreamDependencies.find(node);
-        if (it != m_nodeDownstreamDependencies.cend())
-        {
-            auto& downstreamDeps = it->second;
-            for (auto& downstreamNode : downstreamDeps)
-            {
-                if (--m_nodeUpstreamDependenciesCountCopy[downstreamNode] == 0)
-                {
-                    auto now = std::chrono::high_resolution_clock::now();
-                    printf("(%p) Unblocking node at %lu\n",
-                           static_cast<void*>(downstreamNode),
-                           std::chrono::duration_cast<std::chrono::microseconds>(now - executeStart).count());
-
-                    std::unique_lock<std::mutex> lock(m_unblockedNodesMutex);
-                    m_unblockedNodes.push_back(downstreamNode);
-                    m_unblockedNodesCondition.notify_all();
-                }
-            }
-        }
-    };
-
-    for (auto node : m_nodesWithoutUpstreamDependencies)
-    {
-        auto nodeEmplaceStart = std::chrono::high_resolution_clock::now();
-        m_nodeFutures.push_back(m_threadPool.enqueue(enqueue, node));
-        printf("(%p) Scheduling node at: %lu\n",
-               static_cast<void*>(node),
-               std::chrono::duration_cast<std::chrono::microseconds>(nodeEmplaceStart - executeStart).count());
+        m_nodeUpstreamDependencyCountCopy[key].store(value.load());
     }
 
-    std::size_t remainingNodesToEnqueueCount = m_nodes.size() - m_nodesWithoutUpstreamDependencies.size();
-    while (remainingNodesToEnqueueCount != 0)
-    {
-        std::unique_lock<std::mutex> lock(m_unblockedNodesMutex);
-        m_unblockedNodesCondition.wait(lock, [this] { return !m_unblockedNodes.empty(); });
-        while (m_unblockedNodes.size() != 0)
-        {
-            auto nodeEmplaceStart = std::chrono::high_resolution_clock::now();
-            m_nodeFutures.push_back(m_threadPool.enqueue(enqueue, m_unblockedNodes.back()));
-            printf("(%p) Scheduling node at: %lu\n",
-                   static_cast<void*>(m_unblockedNodes.back()),
-                   std::chrono::duration_cast<std::chrono::microseconds>(nodeEmplaceStart - executeStart).count());
-            m_unblockedNodes.pop_back();
-            --remainingNodesToEnqueueCount;
-        }
-
-        m_nodeFutures.erase(std::remove_if(m_nodeFutures.begin(),
-                                           m_nodeFutures.end(),
-                                           [](const std::future<void>& future)
-                                           { return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready; }),
-                            m_nodeFutures.end());
-    }
-
-    auto schedulingEnd = std::chrono::high_resolution_clock::now();
-    printf("Finished scheduling all nodes: %lu\n",
-           std::chrono::duration_cast<std::chrono::microseconds>(schedulingEnd - executeStart).count());
-
-    for (const auto& future : m_nodeFutures)
-    {
-        future.wait();
-    }
-    m_nodeFutures.clear();
-
-    auto end = std::chrono::high_resolution_clock::now();
-    printf("Execute time: %lu\n---\n", std::chrono::duration_cast<std::chrono::microseconds>(end - executeStart).count());
-    // std::cout << "Execute time (us): " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << std::endl;;
-    // std::cout << "Node time (us): " << std::accumulate(durations.begin(), durations.end(), 0UL) << std::endl;
+    m_condition.notify_all();
+    m_latch.wait();
+    std::destroy_at(reinterpret_cast<std::latch*>(&m_latchBuffer));
 }
 
 template<typename T, Hashable P, bool R, bool E>
@@ -468,7 +471,7 @@ requires(std::equality_comparable<P>) void Graph<T, P, R, E>::connectNodes(CpuNo
 
     assert(hasMatch);
 
-    auto it = m_nodeUpstreamDependenciesCount.emplace(downstream, 0).first;
+    auto it = m_nodeUpstreamDependencyCount.emplace(downstream, 0).first;
     it->second++;
     m_nodeDownstreamDependencies[upstream].push_back(downstream);
 }

@@ -10,6 +10,11 @@ public:
     {
     }
 
+    CpuNode(const CpuNode&) = delete;
+    CpuNode(CpuNode&&) = delete;
+    CpuNode& operator=(const CpuNode&) = delete;
+    CpuNode& operator=(CpuNode&&) = delete;
+
     virtual ~CpuNode() {}
 
     virtual void execute() = 0;

@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <functional>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -15,7 +16,6 @@
 #include <vector>
 #include "CpuNodeIo.h"
 #include "Error.h"
-#include "ThreadPool.h"
 #include "pfr.hpp"
 
 class GraphWithoutRtti
@@ -32,7 +32,6 @@ protected:
 // TODO: Error handling instead of asserts
 // TODO: Use std::source_location
 // TODO: Stop using requires and make a concept
-// TODO: Better integration of the thread pool in order to make a single system call when new work is available
 
 // clang-format off
 template<typename T, Hashable PlaceHolder = std::string_view, bool RttiEnabled = true, bool ErrorsEnabled = true>
@@ -47,6 +46,11 @@ public:
     using Error = std::conditional_t<ErrorsEnabled, ErrorReal, ErrorFake>;
 
     Graph();
+    ~Graph();
+    Graph(const Graph&) = delete;
+    Graph(Graph&&) = delete;
+    Graph& operator=(const Graph&) = delete;
+    Graph& operator=(Graph&&) = delete;
 
     template<typename Node>
     Node* createNode(std::string_view nodeName, NodeInput<Node, PlaceHolder>&& inputs, NodeOutput<Node, PlaceHolder>&& outputs);
@@ -119,16 +123,18 @@ private:
 
     std::vector<std::variant<const void*, void*>> m_IOPointers;
 
-    std::unordered_map<CpuNode*, std::atomic<std::size_t>> m_nodeUpstreamDependenciesCount;
-    std::unordered_map<CpuNode*, std::atomic<std::size_t>> m_nodeUpstreamDependenciesCountCopy;
+    std::unordered_map<CpuNode*, std::atomic<std::size_t>> m_nodeUpstreamDependencyCount;
+    std::unordered_map<CpuNode*, std::atomic<std::size_t>> m_nodeUpstreamDependencyCountCopy;
     std::unordered_map<CpuNode*, std::vector<CpuNode*>> m_nodeDownstreamDependencies;
     std::vector<CpuNode*> m_nodesWithoutUpstreamDependencies;
 
-    ThreadPool m_threadPool;
+    bool m_stop = false;
+    alignas(std::latch) std::array<std::byte, sizeof(std::latch)> m_latchBuffer;
+    std::latch& m_latch = reinterpret_cast<std::latch&>(m_latchBuffer);
+    std::vector<std::thread> m_workers;
     std::vector<CpuNode*> m_unblockedNodes;
-    std::vector<std::future<void>> m_nodeFutures;
-    std::mutex m_unblockedNodesMutex;
-    std::condition_variable m_unblockedNodesCondition;
+    std::mutex m_mutex;
+    std::condition_variable m_condition;
 };
 
 #include "Graph.inl"
