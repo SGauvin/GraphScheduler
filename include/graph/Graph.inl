@@ -157,6 +157,7 @@ requires(std::equality_comparable<P>) void Graph<T, P, R, E>::connectNodes(NodeC
 static void nodeExecutor(const bool& stop, std::latch& latch, std::mutex& mutex, std::condition_variable& condition,
                          std::vector<CpuNode*>& unblockedNodes,
                          std::unordered_map<CpuNode*, std::atomic<std::size_t>>& upstreamDependencyCount,
+                         const std::unordered_map<CpuNode*, std::atomic<std::size_t>>& upstreamDependencyCountOrig,
                          const std::unordered_map<CpuNode*, std::vector<CpuNode*>>& downstreamDependencies)
 {
     CpuNode* nodeToRun;
@@ -184,9 +185,11 @@ static void nodeExecutor(const bool& stop, std::latch& latch, std::mutex& mutex,
             const std::vector<CpuNode*>& downstreamNodes = it->second;
             for (CpuNode* node : downstreamNodes)
             {
-                if (--upstreamDependencyCount.at(node) == 0)
+                auto& atomicCount = upstreamDependencyCount.find(node)->second;
+                if (atomicCount.fetch_sub(1) - 1 == 0)
                 {
                     currentUnblockedNodes.push_back(node);
+                    atomicCount.store(upstreamDependencyCountOrig.find(node)->second.load());
                 }
             }
 
@@ -197,8 +200,8 @@ static void nodeExecutor(const bool& stop, std::latch& latch, std::mutex& mutex,
                 for (CpuNode* node : currentUnblockedNodes)
                 {
                     unblockedNodes.push_back(node);
+                    condition.notify_one();
                 }
-                condition.notify_all();
             }
             currentUnblockedNodes.clear();
         }
@@ -239,6 +242,11 @@ requires(std::equality_comparable<P>) void Graph<T, P, R, E>::build(const std::s
 
     m_unblockedNodes.reserve(m_nodes.size());
 
+    for (const auto& [key, value] : m_nodeUpstreamDependencyCount)
+    {
+        m_nodeUpstreamDependencyCountCopy[key].store(value.load());
+    }
+
     m_workers.reserve(numThreads);
     for (std::size_t thread = 0; thread < numThreads; thread++)
     {
@@ -249,6 +257,7 @@ requires(std::equality_comparable<P>) void Graph<T, P, R, E>::build(const std::s
                                         std::ref(m_condition),
                                         std::ref(m_unblockedNodes),
                                         std::ref(m_nodeUpstreamDependencyCountCopy),
+                                        std::ref(m_nodeUpstreamDependencyCount),
                                         std::ref(m_nodeDownstreamDependencies)));
     }
 }
@@ -283,11 +292,6 @@ requires(std::equality_comparable<P>) void Graph<T, P, R, E>::execute()
     for (CpuNode* node : m_nodesWithoutUpstreamDependencies)
     {
         m_unblockedNodes.push_back(node);
-    }
-
-    for (const auto& [key, value] : m_nodeUpstreamDependencyCount)
-    {
-        m_nodeUpstreamDependencyCountCopy[key].store(value.load());
     }
 
     m_condition.notify_all();
